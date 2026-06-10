@@ -22,6 +22,7 @@ import random
 import socket
 import string
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -404,24 +405,63 @@ def generate_event(dt: datetime, host: str) -> list[LogEntry]:
 class FileSink:
     def __init__(self, output_dir: str):
         os.makedirs(output_dir, exist_ok=True)
-        self._files = {
-            "auth":   open(os.path.join(output_dir, "auth.log"),   "a", buffering=1),
-            "syslog": open(os.path.join(output_dir, "syslog"),     "a", buffering=1),
-            "audit":  open(os.path.join(output_dir, "audit.log"),  "a", buffering=1),
+        self._dir = output_dir
+        self._paths = {
+            "auth":   os.path.join(output_dir, "auth.log"),
+            "syslog": os.path.join(output_dir, "syslog"),
+            "audit":  os.path.join(output_dir, "audit.log"),
         }
+        self._files = {k: open(p, "a", buffering=1) for k, p in self._paths.items()}
+        self._lock = threading.Lock()
 
     def write(self, log_type: str, line: str, _struct: dict):
-        fh = self._files.get(log_type, self._files["syslog"])
-        fh.write(line + "\n")
+        with self._lock:
+            fh = self._files.get(log_type, self._files["syslog"])
+            fh.write(line + "\n")
+
+    def cleanup(self, keep_bytes: int = 0):
+        """Truncate managed log files to free disk space.
+
+        If keep_bytes > 0, retain the trailing keep_bytes of each file
+        (tail buffer) so very recent context survives the rotation.
+        """
+        with self._lock:
+            for key, fh in list(self._files.items()):
+                path = self._paths[key]
+                try:
+                    fh.flush()
+                    fh.close()
+                    if keep_bytes > 0 and os.path.getsize(path) > keep_bytes:
+                        with open(path, "rb") as src:
+                            src.seek(-keep_bytes, os.SEEK_END)
+                            tail = src.read()
+                        # align tail to next newline to avoid splitting a record
+                        nl = tail.find(b"\n")
+                        if nl != -1:
+                            tail = tail[nl + 1:]
+                        with open(path, "wb") as dst:
+                            dst.write(tail)
+                    else:
+                        # full truncate
+                        open(path, "wb").close()
+                except OSError as exc:
+                    print(f"[cleanup warn] {path}: {exc}", file=sys.stderr)
+                finally:
+                    self._files[key] = open(path, "a", buffering=1)
 
     def close(self):
-        for fh in self._files.values():
-            fh.close()
+        with self._lock:
+            for fh in self._files.values():
+                fh.close()
 
 
 class StdoutSink:
     def write(self, log_type: str, line: str, _struct: dict):
         print(line)
+
+    def cleanup(self, keep_bytes: int = 0):
+        # nothing to clean — output is not persisted by this sink
+        pass
 
     def close(self): pass
 
@@ -429,14 +469,39 @@ class StdoutSink:
 class JsonlSink:
     def __init__(self, output_dir: str):
         os.makedirs(output_dir, exist_ok=True)
-        self._fh = open(os.path.join(output_dir, "events.jsonl"), "a", buffering=1)
+        self._path = os.path.join(output_dir, "events.jsonl")
+        self._fh = open(self._path, "a", buffering=1)
+        self._lock = threading.Lock()
 
     def write(self, log_type: str, line: str, struct: dict):
         record = {"log_type": log_type, "raw": line, **struct}
-        self._fh.write(json.dumps(record) + "\n")
+        with self._lock:
+            self._fh.write(json.dumps(record) + "\n")
+
+    def cleanup(self, keep_bytes: int = 0):
+        with self._lock:
+            try:
+                self._fh.flush()
+                self._fh.close()
+                if keep_bytes > 0 and os.path.getsize(self._path) > keep_bytes:
+                    with open(self._path, "rb") as src:
+                        src.seek(-keep_bytes, os.SEEK_END)
+                        tail = src.read()
+                    nl = tail.find(b"\n")
+                    if nl != -1:
+                        tail = tail[nl + 1:]
+                    with open(self._path, "wb") as dst:
+                        dst.write(tail)
+                else:
+                    open(self._path, "wb").close()
+            except OSError as exc:
+                print(f"[cleanup warn] {self._path}: {exc}", file=sys.stderr)
+            finally:
+                self._fh = open(self._path, "a", buffering=1)
 
     def close(self):
-        self._fh.close()
+        with self._lock:
+            self._fh.close()
 
 
 class SplunkHECSink:
@@ -453,6 +518,7 @@ class SplunkHECSink:
         }
         self._batch:  list[dict] = []
         self._batch_size = 50
+        self._lock = threading.Lock()
 
     def write(self, log_type: str, line: str, struct: dict):
         event = {
@@ -464,14 +530,19 @@ class SplunkHECSink:
             "event":      line,
             "fields":     {k: v for k, v in struct.items() if k != "host"},
         }
-        self._batch.append(event)
-        if len(self._batch) >= self._batch_size:
+        with self._lock:
+            self._batch.append(event)
+            should_flush = len(self._batch) >= self._batch_size
+        if should_flush:
             self._flush()
 
     def _flush(self):
-        if not self._batch:
-            return
-        payload = "\n".join(json.dumps(e) for e in self._batch).encode()
+        with self._lock:
+            if not self._batch:
+                return
+            batch = self._batch
+            self._batch = []
+        payload = "\n".join(json.dumps(e) for e in batch).encode()
         req = urllib.request.Request(
             self._url,
             data=payload,
@@ -487,7 +558,11 @@ class SplunkHECSink:
                     print(f"[HEC warn] HTTP {resp.status}", file=sys.stderr)
         except urllib.error.URLError as exc:
             print(f"[HEC error] {exc}", file=sys.stderr)
-        self._batch.clear()
+
+    def cleanup(self, keep_bytes: int = 0):
+        # remote sink — no local disk to clean. Flush any pending batch
+        # so we don't accumulate memory indefinitely.
+        self._flush()
 
     def close(self):
         self._flush()
@@ -501,20 +576,65 @@ class MultiSink:
         for s in self._sinks:
             s.write(log_type, line, struct)
 
+    def cleanup(self, keep_bytes: int = 0):
+        for s in self._sinks:
+            cleanup_fn = getattr(s, "cleanup", None)
+            if callable(cleanup_fn):
+                cleanup_fn(keep_bytes)
+
     def close(self):
         for s in self._sinks:
             s.close()
 
 
 # ---------------------------------------------------------------------------
+# Periodic cleanup
+# ---------------------------------------------------------------------------
+
+def start_cleanup_thread(sink, interval_hours: float, keep_mb: float) -> threading.Event:
+    """Spawn a daemon thread that calls sink.cleanup() every interval_hours.
+
+    Returns a stop Event the caller can set during shutdown to stop the loop.
+    """
+    interval_secs = max(interval_hours * 3600.0, 60.0)
+    keep_bytes = int(max(keep_mb, 0.0) * 1024 * 1024)
+    stop_evt = threading.Event()
+
+    def _loop():
+        print(f"[cleanup] every {interval_hours}h, "
+              f"keep_tail={keep_mb} MB", file=sys.stderr)
+        while not stop_evt.wait(interval_secs):
+            try:
+                sink.cleanup(keep_bytes)
+                print(f"[cleanup] {datetime.now(timezone.utc).isoformat()} "
+                      f"truncated logs (kept last {keep_mb} MB)", file=sys.stderr)
+            except Exception as exc:  # pragma: no cover — defensive
+                print(f"[cleanup error] {exc}", file=sys.stderr)
+
+    t = threading.Thread(target=_loop, name="log-cleanup", daemon=True)
+    t.start()
+    return stop_evt
+
+
+# ---------------------------------------------------------------------------
 # Emulator modes
 # ---------------------------------------------------------------------------
 
-def run_stream(sink, rate: float, host: str):
-    """Real-time streaming — emit ~rate events/sec."""
+def run_stream(sink, rate: float, host: str,
+               cleanup_interval_hours: float = 8.0,
+               cleanup_keep_mb: float = 0.0):
+    """Real-time streaming — emit ~rate events/sec.
+
+    A background daemon thread truncates persistent log sinks every
+    `cleanup_interval_hours` to keep the EC2 volume from filling up.
+    Set cleanup_interval_hours <= 0 to disable.
+    """
     delay = 1.0 / max(rate, 0.01)
     print(f"[emulator] streaming at ~{rate} events/sec, host={host}  (Ctrl-C to stop)",
           file=sys.stderr)
+    stop_cleanup = None
+    if cleanup_interval_hours > 0:
+        stop_cleanup = start_cleanup_thread(sink, cleanup_interval_hours, cleanup_keep_mb)
     total = 0
     try:
         while True:
@@ -526,6 +646,8 @@ def run_stream(sink, rate: float, host: str):
     except KeyboardInterrupt:
         print(f"\n[emulator] stopped after {total} events.", file=sys.stderr)
     finally:
+        if stop_cleanup is not None:
+            stop_cleanup.set()
         sink.close()
 
 
@@ -584,6 +706,14 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Splunk HEC token")
     out.add_argument("--splunk-index", default="main",
                      help="Splunk index (default: main)")
+
+    cleanup = p.add_argument_group("disk cleanup (stream mode only)")
+    cleanup.add_argument("--cleanup-interval-hours", type=float, default=8.0,
+                         help="how often to truncate local log files "
+                              "(default: 8; set <=0 to disable)")
+    cleanup.add_argument("--cleanup-keep-mb", type=float, default=0.0,
+                         help="bytes (in MB) of trailing log content to retain "
+                              "across each cleanup (default: 0 = full truncate)")
     return p
 
 
@@ -614,7 +744,9 @@ def main():
     sink = MultiSink(sinks) if len(sinks) > 1 else sinks[0]
 
     if args.mode == "stream":
-        run_stream(sink, args.rate, args.host)
+        run_stream(sink, args.rate, args.host,
+                   cleanup_interval_hours=args.cleanup_interval_hours,
+                   cleanup_keep_mb=args.cleanup_keep_mb)
     else:
         run_bulk(sink, args.count, args.host, span_hours=args.span_hours)
 
