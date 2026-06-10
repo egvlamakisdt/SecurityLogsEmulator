@@ -1,0 +1,27 @@
+# Ruff configuration — keep the emulator tidy without being pedantic.
+# https://docs.astral.sh/ruff/
+
+target-version = "py310"
+line-length = 100
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line length handled by formatter; allow long log-template strings
+    "E741",  # ambiguous variable names (we use short names like `t`, `s`)
+]
+
+[lint.per-file-ignores]
+"security_log_emulator.py" = [
+    "B008",  # default arg call (argparse default uses random.choice; intentional)
+]
+
+[format]
+quote-style = "double"
