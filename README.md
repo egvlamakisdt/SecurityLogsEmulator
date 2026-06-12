@@ -213,7 +213,7 @@ Ensure the server's security group / firewall allows inbound TCP on that port.
 | **Configuration** | Mode (Stream / Bulk), rate, event count, span, hostname |
 | **Event Catalogue** | Enable / disable individual event generators |
 | **Output Sinks** | File logs, JSONL, stdout — each with configurable path |
-| **Log Cleanup** | Auto-cleanup interval (1 h / 6 h / 12 h / 24 h), keep-tail MB, immediate trigger |
+| **Log Cleanup** | Auto-cleanup interval (15 min / 30 min / 45 min / 60 min), keep-tail MB, immediate trigger |
 | **Bindplane Demo** | Noise injection — see below |
 | **Controls** | Start / Stop, live uptime + event + noise counters |
 | **Live Log Tail** | Color-coded scrolling log output |
