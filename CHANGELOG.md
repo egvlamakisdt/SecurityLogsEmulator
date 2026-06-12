@@ -24,8 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently leaving the status badge on `STOPPED`. The banner is
   dismissible per-message and is fed by a new `last_error` field on
   `/api/status`.
+- **`POST /api/logs/clear`** endpoint to drain the in-memory log ring
+  buffer used by the live tail.
 
 ### Changed
+- **Auto-cleanup interval presets** changed from `1h / 6h / 12h / 24h`
+  to `15m / 30m / 45m / 60m` to better match short demo cycles. Default
+  selection is now 30 minutes. The button selection logic uses
+  `parseFloat` so fractional-hour values match correctly.
+- **Hostname and Output Sink controls are now locked while the emulator
+  is running.** These values are only read once at start, so editing
+  them mid-run had no effect; they are now visually disabled until Stop
+  is clicked. Affects: Hostname dropdown, Log Files / JSONL / Stdout
+  checkboxes, and the file/JSONL path inputs.
 - **Default log output directory is now self-contained inside the repo.**
   The web UI's *Log Files* and *JSONL* fields, and their JS fallbacks,
   default to an absolute path computed from the script's own location
@@ -37,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `resize: vertical` grip.
 
 ### Fixed
+- **Live log tail Clear button now actually clears.** Previously the
+  Clear link only emptied the DOM; the next 1-second poll re-rendered
+  the same buffer. The Clear handler now also drains the server-side
+  ring buffer via `POST /api/logs/clear`.
 - **Uptime counter no longer keeps running after Stop.** A new
   `stopped_at` timestamp is captured when the emulator stops (via the
   Stop button, when bulk mode finishes, on sink-init failure, or on

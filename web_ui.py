@@ -154,6 +154,10 @@ class EmulatorState:
         with self._lock:
             return list(self._log_buf)[-n:]
 
+    def clear_logs(self):
+        with self._lock:
+            self._log_buf.clear()
+
     def start(self, config: dict) -> str:
         with self._lock:
             if self.running:
@@ -439,6 +443,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"result": STATE.stop()})
         elif p == "/api/cleanup":
             self._json(STATE.trigger_cleanup())
+        elif p == "/api/logs/clear":
+            STATE.clear_logs()
+            self._json({"result": "ok"})
         else:
             self.send_response(404); self.end_headers()
 
@@ -690,10 +697,10 @@ HTML = r"""<!DOCTYPE html>
 
       <p class="text-xs text-slate-500 mb-2">Auto-cleanup interval</p>
       <div class="grid grid-cols-4 gap-1 mb-3">
-        <button onclick="setCleanup(1)"  class="cleanup-btn py-1 rounded text-xs" data-h="1">1h</button>
-        <button onclick="setCleanup(6)"  class="cleanup-btn py-1 rounded text-xs" data-h="6">6h</button>
-        <button onclick="setCleanup(12)" class="cleanup-btn py-1 rounded text-xs sel" data-h="12">12h</button>
-        <button onclick="setCleanup(24)" class="cleanup-btn py-1 rounded text-xs" data-h="24">24h</button>
+        <button onclick="setCleanup(0.25)" class="cleanup-btn py-1 rounded text-xs"     data-h="0.25">15m</button>
+        <button onclick="setCleanup(0.5)"  class="cleanup-btn py-1 rounded text-xs sel" data-h="0.5">30m</button>
+        <button onclick="setCleanup(0.75)" class="cleanup-btn py-1 rounded text-xs"     data-h="0.75">45m</button>
+        <button onclick="setCleanup(1)"    class="cleanup-btn py-1 rounded text-xs"     data-h="1">60m</button>
       </div>
 
       <p class="text-xs text-slate-500 mb-1">Keep tail (MB, 0 = full truncate)</p>
@@ -858,8 +865,9 @@ HTML = r"""<!DOCTYPE html>
 <script>
 // ── state ────────────────────────────────────────────────────────────────
 let mode = 'stream';
-let cleanupHours = 12;
+let cleanupHours = 0.5;          // default = 30 minutes
 let lastLogKey = '';   // fingerprint of currently-rendered log buffer
+let lastRunning = null;          // tracks running-state transitions for field locking
 
 // ── theme (light / dark) ─────────────────────────────────────────────────
 function applyTheme(t) {
@@ -923,6 +931,22 @@ function selectAll(v) {
 
 function enabledEvents() {
   return [...document.querySelectorAll('.evt-cb:checked')].map(cb => cb.dataset.name);
+}
+
+// ── lock/unlock config controls when emulator is running ────────────────
+// Hostname + Output Sinks are only read once at start, so changing them
+// mid-run has no effect — disable them while running to make that obvious.
+const LOCKED_IDS = ['host', 'sink-file', 'output-dir',
+                    'sink-jsonl', 'jsonl-dir', 'sink-stdout'];
+function setConfigLocked(locked) {
+  LOCKED_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.disabled = locked;
+      el.classList.toggle('opacity-50', locked);
+      el.classList.toggle('cursor-not-allowed', locked);
+    }
+  });
 }
 
 // ── start / stop ──────────────────────────────────────────────────────────
@@ -995,7 +1019,10 @@ async function triggerCleanup() {
   }
 }
 
-function clearLogs() {
+async function clearLogs() {
+  // Clear the server-side ring buffer first — otherwise the next poll
+  // will re-paint the same lines. Also clears the DOM optimistically.
+  try { await fetch('/api/logs/clear', { method: 'POST' }); } catch (e) {}
   document.getElementById('log-tail').innerHTML =
     '<span class="text-slate-600">Log cleared.</span>';
   lastLogKey = '';
@@ -1085,6 +1112,13 @@ async function poll() {
     // control buttons
     document.getElementById('btn-start').disabled = status.running;
     document.getElementById('btn-stop').disabled  = !status.running;
+
+    // lock Hostname + Output Sink fields while running (only re-apply on
+    // transitions, so the user can keep typing in inputs when stopped)
+    if (status.running !== lastRunning) {
+      lastRunning = status.running;
+      setConfigLocked(status.running);
+    }
 
     // log tail — fingerprint includes count + first + last line so we still
     // re-render once the deque is full and lines roll off the front.
