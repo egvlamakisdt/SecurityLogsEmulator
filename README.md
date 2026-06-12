@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A zero-dependency Python tool that generates realistic Linux / EC2 security logs
-for SIEM testing, detection-rule development, and demos.
+for SIEM testing, detection-rule development, and Bindplane / Dynatrace demos.
 
 It produces log lines in three classic formats:
 
@@ -17,6 +17,10 @@ It produces log lines in three classic formats:
 
 It can write to local files, stdout, JSONL, and/or push directly to a
 **Splunk HTTP Event Collector (HEC)** — multiple sinks at once are supported.
+
+A companion **web UI** (`web_ui.py`) lets you control everything from a browser,
+including a **Bindplane demo mode** that injects noisy/PII logs to showcase
+pipeline filtering before Dynatrace ingest.
 
 > Built for ops/security engineers who need a reproducible stream of believable
 > events to validate Splunk parsing, build detections (e.g. SSH brute-force,
@@ -40,6 +44,8 @@ It can write to local files, stdout, JSONL, and/or push directly to a
   - stdout
   - Splunk HEC (batched, with sourcetype mapping)
 - **Pure stdlib** — no `pip install` required. Runs on any Python 3.10+.
+- **Web UI** — browser-based control panel with live log tail, event catalogue
+  toggles, cleanup scheduling, and Bindplane noise injection.
 
 ---
 
@@ -138,6 +144,86 @@ Outputs (one or more may be combined):
   --splunk-hec-token TOK  Splunk HEC token (required with --splunk-hec-url)
   --splunk-index NAME     Splunk index (default: main)
 ```
+
+---
+
+## Web UI
+
+`web_ui.py` wraps the emulator in a browser-based control panel.
+No extra dependencies — it uses Python's built-in `http.server`.
+
+### Quick start
+
+```bash
+python web_ui.py            # defaults to http://127.0.0.1:8080
+python web_ui.py --port 9090
+```
+
+Then open **http://localhost:8080** in your browser.
+
+### Accessing the UI from a remote / headless Linux server
+
+**Option A — SSH port forward (recommended)**
+
+Run this on your _local_ machine when you SSH in:
+
+```bash
+ssh -L 8080:localhost:8080 user@your-server-ip
+```
+
+Start the web UI on the server as normal, then open `http://localhost:8080`
+in your local browser. No firewall changes needed.
+
+To make the tunnel permanent, add it to `~/.ssh/config`:
+
+```
+Host myserver
+    HostName your-server-ip
+    User ubuntu
+    LocalForward 8080 localhost:8080
+```
+
+**Option B — Bind to all interfaces**
+
+```bash
+python web_ui.py --bind 0.0.0.0 --port 8080
+```
+
+Then open `http://<server-ip>:8080` from any machine on the network.
+Ensure the server's security group / firewall allows inbound TCP on that port.
+
+### UI sections
+
+| Panel | What it controls |
+| ----- | ---------------- |
+| **Configuration** | Mode (Stream / Bulk), rate, event count, span, hostname |
+| **Event Catalogue** | Enable / disable individual event generators |
+| **Output Sinks** | File logs, JSONL, stdout — each with configurable path |
+| **Log Cleanup** | Auto-cleanup interval (1 h / 6 h / 12 h / 24 h), keep-tail MB, immediate trigger |
+| **Bindplane Demo** | Noise injection — see below |
+| **Controls** | Start / Stop, live uptime + event + noise counters |
+| **Live Log Tail** | Color-coded scrolling log output |
+
+### Bindplane demo — noise injection
+
+The **Bindplane Demo** panel injects synthetic noise to showcase how a
+Bindplane pipeline can filter low-value events before they reach Dynatrace,
+reducing ingest volume and cost.
+
+| Noise type | What it generates | Bindplane capability to demo |
+| ---------- | ----------------- | ----------------------------- |
+| **Duplicate logs** | Re-emits the same log line at a configurable rate | Deduplication transform |
+| **Empty-value logs** | Lines where key fields (SRC, USER, COMMAND) are blank | Drop-if-empty / filter transform |
+| **Sensitive data (PII)** | Synthetic SSN, date-of-birth, credit card numbers | Field masking / redaction processor |
+
+Each noise type has an independent toggle and a frequency slider (1–50 %).
+The live log tail highlights PII lines in amber so they are immediately
+visible during a demo.
+
+**Demo script suggestion:** start the emulator with all three noise types
+enabled, then open Bindplane and walk through building a transform pipeline
+(dedup → drop-if-empty → PII mask). Toggle noise on and off to show the
+before/after event rate in Dynatrace.
 
 ---
 
