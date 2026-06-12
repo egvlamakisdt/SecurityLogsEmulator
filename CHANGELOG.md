@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Light / dark theme toggle** in the web UI. A sun/moon button in the
+  header switches the entire interface between dark (default) and light
+  palettes. Choice is persisted across reloads via `localStorage`. CSS
+  was refactored to use theme-scoped custom properties so all colors
+  (cards, inputs, buttons, badges, log tail, scrollbars) adapt cleanly.
+- **In-page error banner** for backend failures. The web UI now surfaces
+  emulator startup errors (e.g. `PermissionError` when the configured
+  output directory is not writable) at the top of the page instead of
+  silently leaving the status badge on `STOPPED`. The banner is
+  dismissible per-message and is fed by a new `last_error` field on
+  `/api/status`.
+
+### Changed
+- **Default log output directory is now self-contained inside the repo.**
+  The web UI's *Log Files* and *JSONL* fields, and their JS fallbacks,
+  default to an absolute path computed from the script's own location
+  (`<repo>/logs/`) rather than the CWD-relative `./logs`. Logs now land
+  in the same place regardless of where `python web_ui.py` is launched
+  from. (`logs/` is already gitignored.)
+
+### Fixed
+- **`generate_event` crash** — `random.choices(*zip(*[(w, f) for w, f in
+  EVENT_CATALOGUE]))` was passing arguments in the wrong order, causing
+  `TypeError: unsupported operand type(s) for +: 'function' and 'function'`
+  on Python 3.12+/3.14. Replaced with the explicit
+  `random.choices(fns, weights=weights, k=1)` form already used by
+  `_weighted_choices`.
+- **Silent emulator thread crash on output-dir permission errors.**
+  `FileSink` / `JsonlSink` construction is now wrapped so a
+  `PermissionError` or `OSError` records a friendly message in
+  `last_error` and stops cleanly instead of killing the worker thread
+  with no UI feedback. Runtime errors inside the stream/bulk loops are
+  also captured the same way.
+
 ## [0.2.0] - 2026-06-12
 
 ### Added

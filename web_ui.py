@@ -34,6 +34,10 @@ from security_log_emulator import (
     _pid,
 )
 
+# Default log output directory — anchored to this script's location so logs
+# always land in <repo>/logs/, regardless of the process's working directory.
+DEFAULT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+
 
 # ---------------------------------------------------------------------------
 # Bindplane demo — noise generators
@@ -127,6 +131,7 @@ class EmulatorState:
         self._log_buf: deque[str] = deque(maxlen=300)
         self._sink = None
         self._cleanup_stop: threading.Event | None = None
+        self.last_error: str | None = None
 
     def status(self) -> dict:
         with self._lock:
@@ -137,6 +142,7 @@ class EmulatorState:
                 "events_noise": self.events_noise,
                 "uptime_secs": round(uptime, 1),
                 "config": self.config,
+                "last_error": self.last_error,
             }
 
     def get_logs(self, n: int = 100) -> list[str]:
@@ -152,6 +158,7 @@ class EmulatorState:
             self.events_noise = 0
             self.started_at = time.time()
             self.running = True
+            self.last_error = None
             self._stop_event.clear()
             self._log_buf.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name="emulator")
@@ -185,12 +192,33 @@ class EmulatorState:
     def _run(self):
         cfg = self.config
         sinks = []
-        if cfg.get("output_dir"):
-            sinks.append(FileSink(cfg["output_dir"]))
-        if cfg.get("jsonl_dir"):
-            sinks.append(JsonlSink(cfg["jsonl_dir"]))
-        if cfg.get("stdout"):
-            sinks.append(StdoutSink())
+        try:
+            if cfg.get("output_dir"):
+                sinks.append(FileSink(cfg["output_dir"]))
+            if cfg.get("jsonl_dir"):
+                sinks.append(JsonlSink(cfg["jsonl_dir"]))
+            if cfg.get("stdout"):
+                sinks.append(StdoutSink())
+        except PermissionError as e:
+            with self._lock:
+                self.last_error = (
+                    f"Permission denied creating output directory "
+                    f"'{e.filename or cfg.get('output_dir') or cfg.get('jsonl_dir')}'. "
+                    "Choose a writable path or disable file/JSONL sinks."
+                )
+                self.running = False
+            for s in sinks:
+                try: s.close()
+                except Exception: pass
+            return
+        except OSError as e:
+            with self._lock:
+                self.last_error = f"Failed to initialize output sink: {e}"
+                self.running = False
+            for s in sinks:
+                try: s.close()
+                except Exception: pass
+            return
 
         state_ref = self
 
@@ -225,6 +253,9 @@ class EmulatorState:
                 self._stream_loop(sink, cfg, host, enabled, dup_prob, empty_prob, pii_prob)
             else:
                 self._bulk_loop(sink, cfg, host, enabled, dup_prob, empty_prob, pii_prob)
+        except Exception as e:
+            with self._lock:
+                self.last_error = f"Emulator error: {e}"
         finally:
             sink.close()
             with self._lock:
@@ -364,12 +395,57 @@ HTML = r"""<!DOCTYPE html>
 <title>Security Log Emulator</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
-  body { background:#0d1117; color:#e2e8f0; font-family:system-ui,sans-serif; }
-  .card { background:#161b22; border:1px solid #30363d; border-radius:.75rem; }
-  .card-accent { background:#161b22; border:1px solid #4f46e5; border-radius:.75rem; }
+  /* ---- Theme tokens (dark = default) ---- */
+  :root {
+    --bg-body:        #0d1117;
+    --bg-card:        #161b22;
+    --bg-input:       #0d1117;
+    --bg-stats:       #0f172a;
+    --bg-log:         #000000;
+    --bg-ghost:       #1f2937;
+    --bg-ghost-hover: #374151;
+    --bg-toggle-off:  #374151;
+    --thumb-off:      #9ca3af;
+    --border-default: #30363d;
+    --border-accent:  #4f46e5;
+    --text-primary:   #e2e8f0;
+    --text-heading:   #ffffff;
+    --text-muted:     #94a3b8;
+    --text-subtle:    #64748b;
+    --text-ghost:     #d1d5db;
+    --scroll-thumb:   #374151;
+    --badge-run-bg:    #064e3b; --badge-run-fg:  #6ee7b7; --badge-run-bd:  #065f46;
+    --badge-stop-bg:   #1c1917; --badge-stop-fg: #f87171; --badge-stop-bd: #7f1d1d;
+  }
+
+  [data-theme="light"] {
+    --bg-body:        #f9fafb;
+    --bg-card:        #ffffff;
+    --bg-input:       #ffffff;
+    --bg-stats:       #f3f4f6;
+    --bg-log:         #1e293b;     /* keep terminal feel for log readability */
+    --bg-ghost:       #f3f4f6;
+    --bg-ghost-hover: #e5e7eb;
+    --bg-toggle-off:  #d1d5db;
+    --thumb-off:      #ffffff;
+    --border-default: #e5e7eb;
+    --border-accent:  #6366f1;
+    --text-primary:   #1f2937;
+    --text-heading:   #0f172a;
+    --text-muted:     #4b5563;
+    --text-subtle:    #6b7280;
+    --text-ghost:     #374151;
+    --scroll-thumb:   #cbd5e1;
+    --badge-run-bg:    #d1fae5; --badge-run-fg:  #065f46; --badge-run-bd:  #a7f3d0;
+    --badge-stop-bg:   #fee2e2; --badge-stop-fg: #991b1b; --badge-stop-bd: #fecaca;
+  }
+
+  body { background:var(--bg-body); color:var(--text-primary); font-family:system-ui,sans-serif; }
+  .card { background:var(--bg-card); border:1px solid var(--border-default); border-radius:.75rem; }
+  .card-accent { background:var(--bg-card); border:1px solid var(--border-accent); border-radius:.75rem; }
   input[type=range] { accent-color:#6366f1; width:100%; }
   input[type=number],input[type=text],select {
-    background:#0d1117; color:#e2e8f0; border:1px solid #30363d;
+    background:var(--bg-input); color:var(--text-primary); border:1px solid var(--border-default);
     border-radius:.375rem; padding:.25rem .5rem; width:100%; font-size:.875rem;
   }
   input[type=number]:focus,input[type=text]:focus,select:focus {
@@ -377,34 +453,53 @@ HTML = r"""<!DOCTYPE html>
   }
   .log-tail { font-family:'Courier New',monospace; font-size:.72rem; line-height:1.4; }
   .log-tail::-webkit-scrollbar { width:4px; }
-  .log-tail::-webkit-scrollbar-thumb { background:#374151; border-radius:2px; }
+  .log-tail::-webkit-scrollbar-thumb { background:var(--scroll-thumb); border-radius:2px; }
 
-  /* toggle switch */
+  /* toggle switch (used for noise toggles AND theme toggle) */
   .tog-wrap { position:relative; display:inline-block; width:2.25rem; height:1.25rem; }
   .tog-inp  { opacity:0; width:0; height:0; position:absolute; }
-  .tog-sl   { position:absolute; inset:0; background:#374151; border-radius:9999px;
+  .tog-sl   { position:absolute; inset:0; background:var(--bg-toggle-off); border-radius:9999px;
               cursor:pointer; transition:.2s; }
   .tog-sl::before { content:""; position:absolute; width:.875rem; height:.875rem;
-                    left:.1875rem; top:.1875rem; background:#9ca3af; border-radius:50%;
+                    left:.1875rem; top:.1875rem; background:var(--thumb-off); border-radius:50%;
                     transition:.2s; }
   .tog-inp:checked + .tog-sl { background:#6366f1; }
   .tog-inp:checked + .tog-sl::before { transform:translateX(1rem); background:#fff; }
 
   .btn-primary   { background:#6366f1; color:#fff; }
   .btn-primary:hover   { background:#4f46e5; }
-  .btn-primary:disabled { background:#374151; color:#6b7280; cursor:not-allowed; }
+  .btn-primary:disabled { background:var(--bg-ghost-hover); color:var(--text-subtle); cursor:not-allowed; }
   .btn-danger    { background:#b91c1c; color:#fff; }
   .btn-danger:hover    { background:#dc2626; }
-  .btn-danger:disabled { background:#374151; color:#6b7280; cursor:not-allowed; }
-  .btn-ghost     { background:#1f2937; color:#d1d5db; }
-  .btn-ghost:hover     { background:#374151; }
+  .btn-danger:disabled { background:var(--bg-ghost-hover); color:var(--text-subtle); cursor:not-allowed; }
+  .btn-ghost     { background:var(--bg-ghost); color:var(--text-ghost); }
+  .btn-ghost:hover     { background:var(--bg-ghost-hover); }
   .btn-active    { background:#4f46e5; color:#fff; }
-  .badge-run  { background:#064e3b; color:#6ee7b7; border:1px solid #065f46; }
-  .badge-stop { background:#1c1917; color:#f87171; border:1px solid #7f1d1d; }
+  .badge-run  { background:var(--badge-run-bg);  color:var(--badge-run-fg);  border:1px solid var(--badge-run-bd); }
+  .badge-stop { background:var(--badge-stop-bg); color:var(--badge-stop-fg); border:1px solid var(--badge-stop-bd); }
 
-  .cleanup-btn        { background:#1f2937; color:#9ca3af; }
+  .cleanup-btn        { background:var(--bg-ghost); color:var(--text-subtle); }
   .cleanup-btn.sel    { background:#4f46e5; color:#fff; }
-  .cleanup-btn:hover  { background:#374151; }
+  .cleanup-btn:hover  { background:var(--bg-ghost-hover); }
+
+  /* ---- Tailwind utility overrides for light theme ---- */
+  [data-theme="light"] .text-white     { color: var(--text-heading) !important; }
+  [data-theme="light"] .text-slate-300 { color: #1f2937 !important; }
+  [data-theme="light"] .text-slate-400 { color: #4b5563 !important; }
+  [data-theme="light"] .text-slate-500 { color: #6b7280 !important; }
+  [data-theme="light"] .text-slate-600 { color: #9ca3af !important; }
+  [data-theme="light"] .bg-slate-900   { background-color: var(--bg-stats) !important; }
+  [data-theme="light"] #log-tail.bg-black { background-color: var(--bg-log) !important; }
+
+  /* theme-toggle button */
+  .theme-btn {
+    background:var(--bg-ghost); color:var(--text-ghost);
+    border:1px solid var(--border-default); border-radius:9999px;
+    width:2rem; height:2rem; display:inline-flex; align-items:center; justify-content:center;
+    cursor:pointer; transition:background-color .2s, color .2s;
+    font-size:.95rem; line-height:1;
+  }
+  .theme-btn:hover { background:var(--bg-ghost-hover); }
 </style>
 </head>
 <body class="min-h-screen p-4 md:p-6">
@@ -423,6 +518,22 @@ HTML = r"""<!DOCTYPE html>
     <span id="hdr-events" class="text-slate-400 text-sm tabular-nums">0 events</span>
     <span id="hdr-noise"  class="text-amber-500 text-sm tabular-nums hidden"></span>
     <span id="hdr-uptime" class="text-slate-600 text-xs hidden"></span>
+    <button id="theme-toggle" type="button" class="theme-btn"
+            onclick="toggleTheme()"
+            aria-label="Toggle light/dark theme"
+            title="Toggle light/dark theme">
+      <span id="theme-icon">🌙</span>
+    </button>
+  </div>
+</div>
+
+<!-- ── Error banner ── -->
+<div id="err-banner"
+     class="hidden mb-4 p-3 rounded border text-sm"
+     style="background:#7f1d1d20; border-color:#b91c1c; color:#fecaca;">
+  <div class="flex items-start justify-between gap-3">
+    <div><strong class="text-red-400">⚠ Error: </strong><span id="err-msg"></span></div>
+    <button onclick="dismissError()" class="text-xs text-slate-400 hover:text-white">dismiss</button>
   </div>
 </div>
 
@@ -474,13 +585,13 @@ HTML = r"""<!DOCTYPE html>
         <input type="checkbox" id="sink-file" checked class="rounded accent-indigo-500">
         <span class="text-sm text-slate-300">Log Files</span>
       </label>
-      <input type="text" id="output-dir" value="./logs" class="mb-3 text-xs" placeholder="./logs">
+      <input type="text" id="output-dir" value="__DEFAULT_LOG_DIR__" class="mb-3 text-xs" placeholder="__DEFAULT_LOG_DIR__">
 
       <label class="flex items-center gap-2 mb-1 cursor-pointer">
         <input type="checkbox" id="sink-jsonl" class="rounded accent-indigo-500">
         <span class="text-sm text-slate-300">JSONL (structured)</span>
       </label>
-      <input type="text" id="jsonl-dir" value="./logs" class="mb-3 text-xs" placeholder="./logs">
+      <input type="text" id="jsonl-dir" value="__DEFAULT_LOG_DIR__" class="mb-3 text-xs" placeholder="__DEFAULT_LOG_DIR__">
 
       <label class="flex items-center gap-2 cursor-pointer">
         <input type="checkbox" id="sink-stdout" class="rounded accent-indigo-500">
@@ -662,6 +773,24 @@ let mode = 'stream';
 let cleanupHours = 12;
 let lastLogLen = -1;
 
+// ── theme (light / dark) ─────────────────────────────────────────────────
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  const icon = document.getElementById('theme-icon');
+  if (icon) icon.textContent = (t === 'light') ? '☀️' : '🌙';
+}
+function toggleTheme() {
+  const cur  = document.documentElement.getAttribute('data-theme') || 'dark';
+  const next = (cur === 'light') ? 'dark' : 'light';
+  try { localStorage.setItem('sle-theme', next); } catch (e) {}
+  applyTheme(next);
+}
+(function initTheme() {
+  let saved = 'dark';
+  try { saved = localStorage.getItem('sle-theme') || 'dark'; } catch (e) {}
+  applyTheme(saved);
+})();
+
 // ── mode ─────────────────────────────────────────────────────────────────
 function setMode(m) {
   mode = m;
@@ -715,9 +844,9 @@ async function startEmulator() {
     span_hours: parseFloat(document.getElementById('span-hours').value) || 24,
     host:       document.getElementById('host').value,
     output_dir: document.getElementById('sink-file').checked
-                  ? (document.getElementById('output-dir').value || './logs') : null,
+                  ? (document.getElementById('output-dir').value || '__DEFAULT_LOG_DIR__') : null,
     jsonl_dir:  document.getElementById('sink-jsonl').checked
-                  ? (document.getElementById('jsonl-dir').value || './logs') : null,
+                  ? (document.getElementById('jsonl-dir').value || '__DEFAULT_LOG_DIR__') : null,
     stdout:     document.getElementById('sink-stdout').checked,
     cleanup_interval_hours: cleanupHours,
     cleanup_keep_mb:        parseFloat(document.getElementById('cleanup-mb').value) || 0,
@@ -748,6 +877,20 @@ function clearLogs() {
   document.getElementById('log-tail').innerHTML =
     '<span class="text-slate-600">Log cleared.</span>';
   lastLogLen = -1;
+}
+
+function dismissError() {
+  const b = document.getElementById('err-banner');
+  b.classList.add('hidden');
+  b._dismissedFor = document.getElementById('err-msg').textContent;
+}
+
+function showError(msg) {
+  const b = document.getElementById('err-banner');
+  if (!msg) { b.classList.add('hidden'); b._dismissedFor = null; return; }
+  if (b._dismissedFor === msg) return;   // user dismissed this exact error
+  document.getElementById('err-msg').textContent = msg;
+  b.classList.remove('hidden');
 }
 
 // ── log coloring ──────────────────────────────────────────────────────────
@@ -781,6 +924,9 @@ async function poll() {
     ]);
     const status = await sr.json();
     const {logs} = await lr.json();
+
+    // surface backend error (e.g. permission denied on output dir)
+    showError(status.last_error);
 
     // badge
     const badge = document.getElementById('status-badge');
@@ -843,6 +989,10 @@ setInterval(poll, 1000);
 </script>
 </body>
 </html>"""
+
+# Substitute the placeholder once at import time so the served page always
+# reflects the absolute path to <repo>/logs/.
+HTML = HTML.replace("__DEFAULT_LOG_DIR__", DEFAULT_LOG_DIR)
 
 
 # ---------------------------------------------------------------------------

@@ -393,7 +393,8 @@ def _weighted_choices(n: int) -> list[Callable]:
 def generate_event(dt: datetime, host: str) -> list[LogEntry]:
     if random.random() < BURST_PROBABILITY:
         return gen_brute_force_burst(dt, host)
-    fn = random.choices(*zip(*[(w, f) for w, f in EVENT_CATALOGUE]))[0]
+    weights, fns = zip(*EVENT_CATALOGUE)
+    fn = random.choices(fns, weights=weights, k=1)[0]
     result = fn(dt, host)
     return [result]
 

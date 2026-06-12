@@ -45,7 +45,8 @@ pipeline filtering before Dynatrace ingest.
   - Splunk HEC (batched, with sourcetype mapping)
 - **Pure stdlib** — no `pip install` required. Runs on any Python 3.10+.
 - **Web UI** — browser-based control panel with live log tail, event catalogue
-  toggles, cleanup scheduling, and Bindplane noise injection.
+  toggles, cleanup scheduling, Bindplane noise injection, and a
+  light / dark theme toggle (persisted across reloads).
 
 ---
 
@@ -160,6 +161,19 @@ python web_ui.py --port 9090
 ```
 
 Then open **http://localhost:8080** in your browser.
+
+> **Theme:** click the sun/moon button in the top-right of the header to
+> toggle between dark and light mode. Your choice is remembered across
+> reloads (stored in `localStorage`).
+>
+> **Default output directory:** the *Log Files* and *JSONL* fields are
+> pre-populated with an absolute path to `<repo>/logs/` (resolved from the
+> location of `web_ui.py`), so output always lands inside the repo
+> regardless of which directory you launched Python from. The `logs/`
+> folder is gitignored. If that path is not writable by your user, the UI
+> will display a red error banner explaining the failure — fix the
+> directory's ownership/permissions or point the field at a writable
+> location (e.g. `/tmp/sle-logs`).
 
 ### Accessing the UI from a remote / headless Linux server
 
