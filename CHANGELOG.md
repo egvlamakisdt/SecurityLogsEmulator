@@ -8,11 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Light / dark theme toggle** in the web UI. A sun/moon button in the
-  header switches the entire interface between dark (default) and light
-  palettes. Choice is persisted across reloads via `localStorage`. CSS
-  was refactored to use theme-scoped custom properties so all colors
-  (cards, inputs, buttons, badges, log tail, scrollbars) adapt cleanly.
+- **Light / dark theme toggle** in the web UI. The button is now a
+  high-contrast, labeled pill (sun + "Light Mode" / moon + "Dark Mode")
+  in the top-right of the header so it's easy to spot in either palette.
+  Choice is persisted across reloads via `localStorage`. CSS was
+  refactored to use theme-scoped custom properties so all colors (cards,
+  inputs, buttons, badges, log tail, scrollbars) adapt cleanly.
+- **Trigger Cleanup feedback.** The button now disables while the request
+  is in-flight, and shows a transient inline status message (green = ok,
+  amber = nothing to clean, red = failed). The `/api/cleanup` endpoint
+  returns a structured `{result, cleaned, mode}` payload.
 - **In-page error banner** for backend failures. The web UI now surfaces
   emulator startup errors (e.g. `PermissionError` when the configured
   output directory is not writable) at the top of the page instead of
@@ -27,8 +32,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`<repo>/logs/`) rather than the CWD-relative `./logs`. Logs now land
   in the same place regardless of where `python web_ui.py` is launched
   from. (`logs/` is already gitignored.)
+- **Live log tail** is taller (was `h-52` / 208 px, now `h-96` / 384 px
+  with `min-height:14rem`) and user-resizable via the standard CSS
+  `resize: vertical` grip.
 
 ### Fixed
+- **Uptime counter no longer keeps running after Stop.** A new
+  `stopped_at` timestamp is captured when the emulator stops (via the
+  Stop button, when bulk mode finishes, on sink-init failure, or on
+  runtime error) and `status()` freezes uptime at `stopped_at -
+  started_at` once the emulator is no longer running.
+- **Trigger Cleanup now actually truncates files when the emulator is
+  stopped.** Previously the handler short-circuited because
+  `EmulatorState._sink` is `None` after the worker thread exits, so the
+  click was a silent no-op. The cleanup path now falls back to
+  truncating the files referenced by the last-used config directly
+  (honoring the configured *Keep tail (MB)* value) and reports per-path
+  permission/IO errors via `last_error`.
+- **Live log tail no longer stops refreshing once the in-memory buffer
+  is full.** The "have logs changed?" check used buffer length, which is
+  pinned at `maxlen=300`, so re-renders were skipped after the deque
+  filled. The check is now a fingerprint of `length + first + last`
+  line, so rolling content is detected and redrawn.
 - **`generate_event` crash** — `random.choices(*zip(*[(w, f) for w, f in
   EVENT_CATALOGUE]))` was passing arguments in the wrong order, causing
   `TypeError: unsupported operand type(s) for +: 'function' and 'function'`

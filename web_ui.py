@@ -126,6 +126,7 @@ class EmulatorState:
         self.events_total: int = 0
         self.events_noise: int = 0
         self.started_at: float | None = None
+        self.stopped_at: float | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._log_buf: deque[str] = deque(maxlen=300)
@@ -135,7 +136,11 @@ class EmulatorState:
 
     def status(self) -> dict:
         with self._lock:
-            uptime = (time.time() - self.started_at) if self.started_at else 0.0
+            if self.started_at is None:
+                uptime = 0.0
+            else:
+                end = self.stopped_at if (not self.running and self.stopped_at) else time.time()
+                uptime = max(0.0, end - self.started_at)
             return {
                 "running": self.running,
                 "events_total": self.events_total,
@@ -157,6 +162,7 @@ class EmulatorState:
             self.events_total = 0
             self.events_noise = 0
             self.started_at = time.time()
+            self.stopped_at = None
             self.running = True
             self.last_error = None
             self._stop_event.clear()
@@ -176,16 +182,72 @@ class EmulatorState:
             self._thread.join(timeout=5)
         with self._lock:
             self.running = False
+            if self.stopped_at is None:
+                self.stopped_at = time.time()
         return "stopped"
 
-    def trigger_cleanup(self):
+    def trigger_cleanup(self) -> dict:
+        """Truncate the configured log files. Works whether or not the
+        emulator is currently running. Returns a dict with `result` and
+        `cleaned` (count) so the UI can give feedback.
+        """
         with self._lock:
             sink = self._sink
-        if sink:
+            cfg  = dict(self.config)
+        keep_mb    = float(cfg.get("cleanup_keep_mb", 0.0))
+        keep_bytes = int(keep_mb * 1024 * 1024)
+
+        # Path A — emulator is running: defer to the live MultiSink which
+        # holds the open file handles and will reopen them after truncation.
+        if sink is not None:
             try:
-                sink.cleanup(0)
-            except Exception:
-                pass
+                sink.cleanup(keep_bytes)
+                return {"result": "ok", "cleaned": -1, "mode": "live"}
+            except Exception as e:
+                with self._lock:
+                    self.last_error = f"Cleanup failed: {e}"
+                return {"result": "error", "error": str(e)}
+
+        # Path B — emulator is stopped: truncate the files referenced by the
+        # last-used config directly. (Without this, clicking "Trigger Cleanup"
+        # after Stop was a silent no-op.)
+        targets: list[str] = []
+        if cfg.get("output_dir"):
+            for name in ("auth.log", "syslog", "audit.log"):
+                targets.append(os.path.join(cfg["output_dir"], name))
+        if cfg.get("jsonl_dir"):
+            targets.append(os.path.join(cfg["jsonl_dir"], "events.jsonl"))
+        if not targets:
+            return {"result": "no_files", "cleaned": 0,
+                    "message": "No file/JSONL sink configured — nothing to clean."}
+
+        cleaned = 0
+        errors: list[str] = []
+        for path in targets:
+            if not os.path.exists(path):
+                continue
+            try:
+                if keep_bytes > 0 and os.path.getsize(path) > keep_bytes:
+                    with open(path, "rb") as src:
+                        src.seek(-keep_bytes, os.SEEK_END)
+                        tail = src.read()
+                    nl = tail.find(b"\n")
+                    if nl != -1:
+                        tail = tail[nl + 1:]
+                    with open(path, "wb") as dst:
+                        dst.write(tail)
+                else:
+                    open(path, "wb").close()  # full truncate
+                cleaned += 1
+            except OSError as e:
+                errors.append(f"{path}: {e}")
+
+        if errors:
+            msg = "Cleanup failed for: " + "; ".join(errors)
+            with self._lock:
+                self.last_error = msg
+            return {"result": "error", "cleaned": cleaned, "error": msg}
+        return {"result": "ok", "cleaned": cleaned, "mode": "offline"}
 
     # ── internal ──────────────────────────────────────────────────────────
 
@@ -207,6 +269,8 @@ class EmulatorState:
                     "Choose a writable path or disable file/JSONL sinks."
                 )
                 self.running = False
+                if self.stopped_at is None:
+                    self.stopped_at = time.time()
             for s in sinks:
                 try: s.close()
                 except Exception: pass
@@ -215,6 +279,8 @@ class EmulatorState:
             with self._lock:
                 self.last_error = f"Failed to initialize output sink: {e}"
                 self.running = False
+                if self.stopped_at is None:
+                    self.stopped_at = time.time()
             for s in sinks:
                 try: s.close()
                 except Exception: pass
@@ -261,6 +327,8 @@ class EmulatorState:
             with self._lock:
                 self._sink = None
                 self.running = False
+                if self.stopped_at is None:
+                    self.stopped_at = time.time()
 
     def _filter(self, entries, enabled):
         filtered = [e for e in entries
@@ -370,8 +438,7 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/stop":
             self._json({"result": STATE.stop()})
         elif p == "/api/cleanup":
-            STATE.trigger_cleanup()
-            self._json({"result": "ok"})
+            self._json(STATE.trigger_cleanup())
         else:
             self.send_response(404); self.end_headers()
 
@@ -491,15 +558,32 @@ HTML = r"""<!DOCTYPE html>
   [data-theme="light"] .bg-slate-900   { background-color: var(--bg-stats) !important; }
   [data-theme="light"] #log-tail.bg-black { background-color: var(--bg-log) !important; }
 
-  /* theme-toggle button */
+  /* theme-toggle button — deliberately high contrast and labeled so it's
+     easy to find in either mode. Renders as a pill with icon + word. */
   .theme-btn {
-    background:var(--bg-ghost); color:var(--text-ghost);
-    border:1px solid var(--border-default); border-radius:9999px;
-    width:2rem; height:2rem; display:inline-flex; align-items:center; justify-content:center;
-    cursor:pointer; transition:background-color .2s, color .2s;
-    font-size:.95rem; line-height:1;
+    display:inline-flex; align-items:center; gap:.4rem;
+    padding:.4rem .85rem; border-radius:9999px;
+    font-size:.8rem; font-weight:600; line-height:1;
+    cursor:pointer; transition:transform .1s, background-color .2s, color .2s, box-shadow .2s;
+    border:2px solid transparent;
   }
-  .theme-btn:hover { background:var(--bg-ghost-hover); }
+  .theme-btn .theme-icon { font-size:1rem; line-height:1; }
+  .theme-btn:hover  { transform: translateY(-1px); }
+  .theme-btn:active { transform: translateY(0); }
+  /* When in DARK mode the button advertises switching TO light: bright/yellow */
+  :root .theme-btn,
+  [data-theme="dark"] .theme-btn {
+    background:#facc15; color:#1f2937; border-color:#eab308;
+    box-shadow:0 0 0 1px rgba(0,0,0,.2), 0 4px 14px rgba(250,204,21,.25);
+  }
+  :root .theme-btn:hover,
+  [data-theme="dark"] .theme-btn:hover { background:#fde047; }
+  /* When in LIGHT mode the button advertises switching TO dark: deep slate */
+  [data-theme="light"] .theme-btn {
+    background:#0f172a; color:#fde68a; border-color:#0f172a;
+    box-shadow:0 0 0 1px rgba(255,255,255,.6), 0 4px 14px rgba(15,23,42,.25);
+  }
+  [data-theme="light"] .theme-btn:hover { background:#1e293b; }
 </style>
 </head>
 <body class="min-h-screen p-4 md:p-6">
@@ -522,7 +606,8 @@ HTML = r"""<!DOCTYPE html>
             onclick="toggleTheme()"
             aria-label="Toggle light/dark theme"
             title="Toggle light/dark theme">
-      <span id="theme-icon">🌙</span>
+      <span id="theme-icon" class="theme-icon">🌙</span>
+      <span id="theme-label">Dark Mode</span>
     </button>
   </div>
 </div>
@@ -614,10 +699,11 @@ HTML = r"""<!DOCTYPE html>
       <p class="text-xs text-slate-500 mb-1">Keep tail (MB, 0 = full truncate)</p>
       <input type="number" id="cleanup-mb" value="0" min="0" max="500" step="0.5" class="mb-3">
 
-      <button onclick="triggerCleanup()"
+      <button id="btn-cleanup" onclick="triggerCleanup()"
         class="w-full py-1.5 rounded text-xs font-medium btn-ghost transition-colors">
         ⟳ Trigger Cleanup Now
       </button>
+      <p id="cleanup-status" class="text-xs text-slate-500 mt-2 hidden"></p>
     </div>
 
   </div>
@@ -762,7 +848,9 @@ HTML = r"""<!DOCTYPE html>
       <button onclick="clearLogs()" class="text-xs text-slate-600 hover:text-slate-400">Clear</button>
     </div>
   </div>
-  <div id="log-tail" class="log-tail h-52 overflow-y-auto bg-black rounded p-2">
+  <div id="log-tail"
+       class="log-tail h-96 overflow-y-auto bg-black rounded p-2"
+       style="min-height:14rem; resize:vertical;">
     <span class="text-slate-600">Waiting for emulator to start…</span>
   </div>
 </div>
@@ -771,13 +859,15 @@ HTML = r"""<!DOCTYPE html>
 // ── state ────────────────────────────────────────────────────────────────
 let mode = 'stream';
 let cleanupHours = 12;
-let lastLogLen = -1;
+let lastLogKey = '';   // fingerprint of currently-rendered log buffer
 
 // ── theme (light / dark) ─────────────────────────────────────────────────
 function applyTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
-  const icon = document.getElementById('theme-icon');
-  if (icon) icon.textContent = (t === 'light') ? '☀️' : '🌙';
+  const icon  = document.getElementById('theme-icon');
+  const label = document.getElementById('theme-label');
+  if (icon)  icon.textContent  = (t === 'light') ? '☀️' : '🌙';
+  if (label) label.textContent = (t === 'light') ? 'Light Mode' : 'Dark Mode';
 }
 function toggleTheme() {
   const cur  = document.documentElement.getAttribute('data-theme') || 'dark';
@@ -870,13 +960,45 @@ async function stopEmulator() {
 }
 
 async function triggerCleanup() {
-  await fetch('/api/cleanup', { method: 'POST' });
+  const btn  = document.getElementById('btn-cleanup');
+  const stat = document.getElementById('cleanup-status');
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '… cleaning';
+  try {
+    const r    = await fetch('/api/cleanup', { method: 'POST' });
+    const data = await r.json();
+    let msg, color;
+    if (data.result === 'ok') {
+      msg   = (data.mode === 'live')
+              ? 'Cleanup sent to live emulator sinks.'
+              : `Truncated ${data.cleaned} file(s).`;
+      color = 'text-emerald-400';
+    } else if (data.result === 'no_files') {
+      msg   = data.message || 'Nothing to clean.';
+      color = 'text-slate-400';
+    } else {
+      msg   = 'Cleanup failed — see error banner.';
+      color = 'text-red-400';
+    }
+    stat.className = 'text-xs mt-2 ' + color;
+    stat.textContent = msg;
+    stat.classList.remove('hidden');
+    setTimeout(() => stat.classList.add('hidden'), 6000);
+  } catch (e) {
+    stat.className = 'text-xs mt-2 text-red-400';
+    stat.textContent = 'Request failed: ' + e;
+    stat.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
 }
 
 function clearLogs() {
   document.getElementById('log-tail').innerHTML =
     '<span class="text-slate-600">Log cleared.</span>';
-  lastLogLen = -1;
+  lastLogKey = '';
 }
 
 function dismissError() {
@@ -964,9 +1086,11 @@ async function poll() {
     document.getElementById('btn-start').disabled = status.running;
     document.getElementById('btn-stop').disabled  = !status.running;
 
-    // log tail — only re-render when content changes
-    if (logs.length !== lastLogLen) {
-      lastLogLen = logs.length;
+    // log tail — fingerprint includes count + first + last line so we still
+    // re-render once the deque is full and lines roll off the front.
+    const key = logs.length + '|' + (logs[0] || '') + '|' + (logs[logs.length - 1] || '');
+    if (key !== lastLogKey) {
+      lastLogKey = key;
       const tail = document.getElementById('log-tail');
       if (logs.length === 0) {
         tail.innerHTML = '<span class="text-slate-600">No logs yet.</span>';
